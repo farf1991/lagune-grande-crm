@@ -16,9 +16,10 @@ export interface Lead {
   id: number
   nom: string
   tel: string
-  email?: string
+  ville?: string
   source: Source
-  budget?: string
+  besoin?: string
+  horaire?: string
   projet: string
   statut: Statut
   motif_perdu?: string

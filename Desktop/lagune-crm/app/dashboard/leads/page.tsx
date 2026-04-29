@@ -1,6 +1,6 @@
 'use client'
 import { useState, useEffect, useCallback } from 'react'
-import { supabase } from '@/lib/supabase'
+import { createClientComponentClient } from '@supabase/auth-helpers-nextjs'
 import { Lead, Profile, STATUTS, SOURCES, MOTIFS_PERTE, STATUT_COLORS, SOURCE_COLORS } from '@/lib/types'
 
 // ============ HELPERS ============
@@ -26,11 +26,12 @@ function statusStyle(statut: string) {
 
 // ============ MAIN ============
 export default function LeadsPage() {
+  const supabase = createClientComponentClient()
   const [leads, setLeads] = useState<Lead[]>([])
   const [profiles, setProfiles] = useState<Profile[]>([])
   const [me, setMe] = useState<Profile | null>(null)
   const [loading, setLoading] = useState(true)
-  const [view, setView] = useState<'table'|'kanban'>('table')
+  const [view, setView] = useState<'espace'|'table'|'kanban'>('table')
   const [search, setSearch] = useState('')
   const [filterStatut, setFilterStatut] = useState('')
   const [filterSource, setFilterSource] = useState('')
@@ -55,6 +56,7 @@ export default function LeadsPage() {
     const { data: profs } = await supabase.from('profiles').select('*')
     setProfiles(profs || [])
     const isManager = prof?.role === 'admin' || prof?.role === 'manager'
+    if (prof?.role === 'commercial') setView('espace')
     let q = supabase.from('leads').select('*, lead_logs(*), profile:assigne_id(*)').order('created_at', { ascending: false })
     if (!isManager) q = q.eq('assigne_id', session.user.id)
     const { data } = await q
@@ -84,12 +86,17 @@ export default function LeadsPage() {
   // ---- ACTIONS ----
   const changeStatut = async (leadId: number, statut: string) => {
     if (statut === 'Perdu') { setPendingStatut({ leadId, statut }); setShowPerdu(true); return }
-    const { error } = await supabase.from('leads').update({ statut }).eq('id', leadId)
+    const lead = leads.find(l => l.id === leadId)
+    const updates: any = { statut }
+    if (lead && !lead.relance_date && !['Vendu', 'Perdu'].includes(statut)) {
+      updates.relance_date = new Date(Date.now() + 48 * 3600 * 1000).toISOString()
+    }
+    const { error } = await supabase.from('leads').update(updates).eq('id', leadId)
     if (!error) {
       await supabase.from('lead_logs').insert({ lead_id: leadId, auteur_id: me?.id, action: `Statut → ${statut}`, result: null, note: '' })
       showToast(`✅ Statut : ${statut}`)
       loadData()
-      if (selectedLead?.id === leadId) setSelectedLead(prev => prev ? {...prev, statut: statut as any} : null)
+      if (selectedLead?.id === leadId) setSelectedLead(prev => prev ? { ...prev, statut: statut as any } : null)
     }
   }
 
@@ -108,15 +115,19 @@ export default function LeadsPage() {
   }
 
   const logAppel = async (leadId: number, result: string) => {
-    await supabase.from('lead_logs').insert({ lead_id: leadId, auteur_id: me?.id, action: 'Appel effectué', result, note: logNote })
-    // Auto-avance statut
+    await supabase.from('lead_logs').insert({ lead_id: leadId, auteur_id: me?.id, action: 'Mémo appel', result, note: logNote })
     const lead = leads.find(l => l.id === leadId)
     if (lead) {
-      if (result === 'Répondu' && lead.statut === 'Nouveau') await supabase.from('leads').update({ statut: 'Contacté' }).eq('id', leadId)
-      if (result === 'Pas répondu' && lead.statut === 'Contacté') await supabase.from('leads').update({ statut: 'Relance 1' }).eq('id', leadId)
+      const updates: any = {}
+      if (result === 'Répondu' && lead.statut === 'Nouveau') updates.statut = 'Contacté'
+      if (result === 'Pas répondu' && lead.statut === 'Contacté') updates.statut = 'Relance 1'
+      // Auto-relance 48h si aucune relance programmée et lead actif
+      if (!lead.relance_date && !['Vendu', 'Perdu'].includes(lead.statut)) {
+        updates.relance_date = new Date(Date.now() + 48 * 3600 * 1000).toISOString()
+      }
+      if (Object.keys(updates).length > 0) await supabase.from('leads').update(updates).eq('id', leadId)
     }
     setLogNote(''); showToast(`📞 Appel loggué : ${result}`); loadData()
-    // Reopen lead
     const { data } = await supabase.from('leads').select('*, lead_logs(*), profile:assigne_id(*)').eq('id', leadId).single()
     if (data) setSelectedLead(data)
   }
@@ -193,13 +204,102 @@ export default function LeadsPage() {
           </select>
         )}
         <div style={{ display: 'flex', gap: '4px', background: 'white', border: '1.5px solid rgba(26,58,74,0.12)', borderRadius: '9px', padding: '4px' }}>
-          {(['table','kanban'] as const).map(v => (
+          {([['espace','🎯 Mon espace'],['table','📋 Tableau'],['kanban','🗂️ Kanban']] as const).map(([v, label]) => (
             <button key={v} onClick={() => setView(v)} style={{ padding: '6px 12px', borderRadius: '6px', border: 'none', cursor: 'pointer', fontSize: '13px', fontFamily: 'Outfit,sans-serif', fontWeight: 500, background: view === v ? '#1a3a4a' : 'none', color: view === v ? 'white' : '#9a9a9a', transition: 'all 0.15s' }}>
-              {v === 'table' ? '📋 Tableau' : '🗂️ Kanban'}
+              {label}
             </button>
           ))}
         </div>
       </div>
+
+      {/* MON ESPACE VIEW */}
+      {view === 'espace' && (() => {
+        const nouveaux = leads
+          .filter(l => l.statut === 'Nouveau')
+          .sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime())
+        const relances = leads
+          .filter(l => l.relance_date && l.statut !== 'Nouveau' && l.statut !== 'Vendu' && l.statut !== 'Perdu')
+          .sort((a, b) => new Date(a.relance_date!).getTime() - new Date(b.relance_date!).getTime())
+
+        const relanceLabel = (d: string) => {
+          const diff = Math.floor((new Date(d).getTime() - Date.now()) / 86400000)
+          if (diff < -1) return { text: `En retard de ${-diff}j`, color: '#e05a3a' }
+          if (diff < 0) return { text: 'En retard', color: '#e05a3a' }
+          if (diff === 0) return { text: "Aujourd'hui", color: '#d4852a' }
+          if (diff === 1) return { text: 'Demain', color: '#2a7a8a' }
+          return { text: `Dans ${diff}j`, color: '#2a7a8a' }
+        }
+
+        const EspaceCard = ({ lead, type }: { lead: Lead; type: 'nouveau' | 'relance' }) => {
+          const h = hoursAgo(lead.created_at)
+          const ageColor = h < 24 ? '#2d8a5e' : h < 48 ? '#d4852a' : '#e05a3a'
+          const rl = lead.relance_date ? relanceLabel(lead.relance_date) : null
+          const border = type === 'relance' && rl?.color === '#e05a3a' ? '#e05a3a'
+            : type === 'nouveau' && h >= 48 ? '#e05a3a' : 'rgba(26,58,74,0.1)'
+          return (
+            <div onClick={() => setSelectedLead(lead)} style={{ background: 'white', borderRadius: '12px', border: `1.5px solid ${border}`, padding: '14px 18px', cursor: 'pointer', boxShadow: '0 2px 8px rgba(26,58,74,0.05)', display: 'flex', alignItems: 'center', gap: '16px' }}>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap' }}>
+                  <span style={{ fontSize: '15px', fontWeight: 700, color: '#1a3a4a' }}>{lead.nom}</span>
+                  <span style={{ fontSize: '13px', color: '#2a7a8a', fontWeight: 600 }}>{lead.tel}</span>
+                </div>
+                <div style={{ display: 'flex', gap: '10px', marginTop: '4px', flexWrap: 'wrap' }}>
+                  {lead.ville && <span style={{ fontSize: '12px', color: '#9a9a9a' }}>📍 {lead.ville}</span>}
+                  {lead.besoin && <span style={{ fontSize: '12px', color: '#9a9a9a' }}>🏠 {lead.besoin}</span>}
+                  {lead.horaire && <span style={{ fontSize: '12px', color: '#9a9a9a' }}>⏰ {lead.horaire}</span>}
+                  {type === 'relance' && <span style={statusStyle(lead.statut)}>{lead.statut}</span>}
+                </div>
+              </div>
+              <div style={{ display: 'flex', flex:'column', alignItems: 'flex-end', gap: '6px', flexShrink: 0 }}>
+                {type === 'nouveau' && (
+                  <span style={{ fontSize: '11px', fontWeight: 700, color: ageColor, background: ageColor + '18', padding: '3px 8px', borderRadius: '8px' }}>
+                    {h < 24 ? `${h}h` : `${Math.floor(h/24)}j`}
+                  </span>
+                )}
+                {type === 'relance' && rl && (
+                  <span style={{ fontSize: '11px', fontWeight: 700, color: rl.color, background: rl.color + '18', padding: '3px 8px', borderRadius: '8px' }}>{rl.text}</span>
+                )}
+                <div style={{ display: 'flex', gap: '6px' }} onClick={e => e.stopPropagation()}>
+                  <a href={`tel:${lead.tel}`} style={{ padding: '5px 10px', borderRadius: '6px', background: 'rgba(42,122,138,0.08)', color: '#2a7a8a', border: '1px solid rgba(42,122,138,0.2)', fontSize: '11px', fontWeight: 600, textDecoration: 'none' }}>📞</a>
+                  <a href={`https://wa.me/${lead.tel.replace(/\D/g,'')}`} target="_blank" rel="noreferrer" style={{ padding: '5px 10px', borderRadius: '6px', background: 'rgba(37,211,102,0.08)', color: '#1a8a3a', border: '1px solid rgba(37,211,102,0.2)', fontSize: '11px', fontWeight: 600, textDecoration: 'none' }}>💬</a>
+                </div>
+              </div>
+            </div>
+          )
+        }
+
+        return (
+          <div style={{ maxWidth: '820px' }}>
+            {nouveaux.length === 0 && relances.length === 0 && (
+              <div style={{ textAlign: 'center', padding: '60px', color: '#9a9a9a', fontSize: '15px', background: 'white', borderRadius: '12px', border: '1px solid rgba(26,58,74,0.1)' }}>✅ Rien à traiter</div>
+            )}
+            {nouveaux.length > 0 && (
+              <div style={{ marginBottom: '24px' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '10px' }}>
+                  <span style={{ width: '8px', height: '8px', borderRadius: '50%', background: '#2a7a8a', display: 'inline-block' }} />
+                  <span style={{ fontSize: '12px', fontWeight: 700, color: '#1a3a4a', textTransform: 'uppercase', letterSpacing: '1px' }}>Nouveaux leads à appeler</span>
+                  <span style={{ fontSize: '11px', fontWeight: 700, background: '#2a7a8a', color: 'white', padding: '2px 7px', borderRadius: '10px' }}>{nouveaux.length}</span>
+                </div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                  {nouveaux.map(l => <EspaceCard key={l.id} lead={l} type="nouveau" />)}
+                </div>
+              </div>
+            )}
+            {relances.length > 0 && (
+              <div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '10px' }}>
+                  <span style={{ width: '8px', height: '8px', borderRadius: '50%', background: '#d4852a', display: 'inline-block' }} />
+                  <span style={{ fontSize: '12px', fontWeight: 700, color: '#1a3a4a', textTransform: 'uppercase', letterSpacing: '1px' }}>Relances</span>
+                  <span style={{ fontSize: '11px', fontWeight: 700, background: '#d4852a', color: 'white', padding: '2px 7px', borderRadius: '10px' }}>{relances.length}</span>
+                </div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                  {relances.map(l => <EspaceCard key={l.id} lead={l} type="relance" />)}
+                </div>
+              </div>
+            )}
+          </div>
+        )
+      })()}
 
       {/* TABLE VIEW */}
       {view === 'table' && (
@@ -207,7 +307,7 @@ export default function LeadsPage() {
           <table style={{ width: '100%', borderCollapse: 'collapse' }}>
             <thead>
               <tr style={{ background: '#f5f0e8', borderBottom: '1.5px solid rgba(26,58,74,0.1)' }}>
-                {['Lead','Téléphone','Source','Budget', ...(isManager?['Commercial']:[]), 'Statut','Ancienneté','Relance','Actions'].map(h => (
+                {['Lead','Téléphone','Ville','Source','Besoin','Horaire', ...(isManager?['Commercial']:[]), 'Statut','Ancienneté','Relance','Actions'].map(h => (
                   <th key={h} style={{ padding: '11px 14px', textAlign: 'left', fontSize: '11px', textTransform: 'uppercase', letterSpacing: '1px', color: '#9a9a9a', fontWeight: 600, whiteSpace: 'nowrap' }}>{h}</th>
                 ))}
               </tr>
@@ -224,10 +324,12 @@ export default function LeadsPage() {
                       <div style={{ fontSize: '11px', color: '#9a9a9a', marginTop: '2px' }}>{l.email||'—'}</div>
                     </td>
                     <td style={{ padding: '12px 14px', fontSize: '13px', fontWeight: 500, color: '#5a5a5a' }}>{l.tel}</td>
+                    <td style={{ padding: '12px 14px', fontSize: '13px', color: '#5a5a5a' }}>{l.ville||'—'}</td>
                     <td style={{ padding: '12px 14px' }}>
                       <span style={{ background: sourceCls(l.source)+'18', color: sourceCls(l.source), padding: '3px 9px', borderRadius: '20px', fontSize: '11px', fontWeight: 600 }}>{l.source}</span>
                     </td>
-                    <td style={{ padding: '12px 14px', fontSize: '13px', fontWeight: 600, color: '#1a3a4a' }}>{l.budget||'—'}</td>
+                    <td style={{ padding: '12px 14px', fontSize: '13px', color: '#5a5a5a' }}>{l.besoin||'—'}</td>
+                    <td style={{ padding: '12px 14px', fontSize: '13px', color: '#5a5a5a' }}>{l.horaire||'—'}</td>
                     {isManager && <td style={{ padding: '12px 14px', fontSize: '12px', color: '#9a9a9a' }}>{com?.nom||'—'}</td>}
                     <td style={{ padding: '12px 14px' }}><span style={statusStyle(l.statut)}>{l.statut}</span></td>
                     <td style={{ padding: '12px 14px' }}>
@@ -304,9 +406,10 @@ export default function LeadsPage() {
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '14px', marginBottom: '16px' }}>
                 {[
                   ['Téléphone', selectedLead.tel],
-                  ['Email', selectedLead.email||'—'],
+                  ['Ville', selectedLead.ville||'—'],
                   ['Source', selectedLead.source],
-                  ['Budget', selectedLead.budget||'—'],
+                  ['Besoin', selectedLead.besoin||'—'],
+                  ['Horaire de contact', selectedLead.horaire||'—'],
                   ['Projet', selectedLead.projet],
                   ['Commercial', profiles.find(p=>p.id===selectedLead.assigne_id)?.nom||'—'],
                   ['Créé le', new Date(selectedLead.created_at).toLocaleDateString('fr-FR',{day:'2-digit',month:'long',year:'numeric'})],
@@ -330,31 +433,38 @@ export default function LeadsPage() {
 
               <div style={{ height: '1px', background: 'rgba(26,58,74,0.1)', margin: '18px 0' }} />
 
-              {/* Change statut */}
-              <div style={{ marginBottom: '14px' }}>
-                <label style={fieldLabel}>Changer le statut</label>
-                <select value={selectedLead.statut} onChange={e => changeStatut(selectedLead.id, e.target.value)} style={{ ...selStyle, width: '100%', padding: '10px 12px', color: '#1a3a4a', fontWeight: 600 }}>
-                  {STATUTS.map(s => <option key={s} value={s}>{s}</option>)}
-                </select>
-              </div>
-
-              {/* Relance */}
-              <div style={{ background: '#f5f0e8', borderRadius: '10px', padding: '14px', marginBottom: '16px' }}>
-                <label style={fieldLabel}>🔔 Programmer une relance</label>
-                <input type="datetime-local" defaultValue={selectedLead.relance_date?.slice(0,16)||''} onChange={e => setRelanceInput(e.target.value)} style={{ width: '100%', padding: '9px 12px', border: '1.5px solid rgba(26,58,74,0.15)', borderRadius: '8px', fontFamily: 'Outfit,sans-serif', fontSize: '13px', background: 'white' }} />
-                <button onClick={() => saveRelance(selectedLead.id, relanceInput)} style={{ ...btnPrimary, marginTop: '8px', padding: '7px 14px', fontSize: '12px' }}>Enregistrer la relance</button>
-              </div>
-
-              {/* Log appel */}
-              <div style={{ marginBottom: '16px' }}>
-                <label style={fieldLabel}>📞 Logger un appel</label>
-                <textarea value={logNote} onChange={e => setLogNote(e.target.value)} placeholder="Note sur l'appel..." style={{ width: '100%', padding: '10px 12px', border: '1.5px solid rgba(26,58,74,0.12)', borderRadius: '8px', fontFamily: 'Outfit,sans-serif', fontSize: '13px', minHeight: '70px', resize: 'vertical', marginBottom: '8px' }} />
-                <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
-                  {['Répondu','Pas répondu','Rappel demandé'].map(r => (
-                    <button key={r} onClick={() => logAppel(selectedLead.id, r)} style={{ ...btnBase, padding: '6px 12px', fontSize: '12px', background: r==='Répondu'?'rgba(45,138,94,0.1)':r==='Pas répondu'?'rgba(224,90,58,0.1)':'rgba(212,133,42,0.1)', color: r==='Répondu'?'#2d8a5e':r==='Pas répondu'?'#e05a3a':'#d4852a', border: `1px solid ${r==='Répondu'?'rgba(45,138,94,0.3)':r==='Pas répondu'?'rgba(224,90,58,0.3)':'rgba(212,133,42,0.3)'}` }}>
-                      {r}
-                    </button>
+              {/* Mémo appel — bloc unifié */}
+              <div style={{ background: '#f5f0e8', borderRadius: '12px', padding: '16px', marginBottom: '16px' }}>
+                <label style={fieldLabel}>📞 Mémo appel</label>
+                <textarea value={logNote} onChange={e => setLogNote(e.target.value)} placeholder="Note sur l'appel (optionnel)..." style={{ width: '100%', padding: '10px 12px', border: '1.5px solid rgba(26,58,74,0.12)', borderRadius: '8px', fontFamily: 'Outfit,sans-serif', fontSize: '13px', minHeight: '60px', resize: 'vertical', marginBottom: '12px', background: 'white', boxSizing: 'border-box' }} />
+                {/* Résultat appel */}
+                <div style={{ display: 'flex', gap: '8px', marginBottom: '12px', flexWrap: 'wrap' }}>
+                  {([['Répondu','#2d8a5e'],['Pas répondu','#e05a3a'],['Rappel demandé','#d4852a']] as const).map(([r, c]) => (
+                    <button key={r} onClick={() => logAppel(selectedLead.id, r)} style={{ ...btnBase, padding: '8px 14px', fontSize: '13px', background: c + '15', color: c, border: `1.5px solid ${c}40`, fontWeight: 700 }}>{r}</button>
                   ))}
+                </div>
+                {/* Statuts directs */}
+                <div style={{ borderTop: '1px solid rgba(26,58,74,0.1)', paddingTop: '12px' }}>
+                  <div style={{ fontSize: '10px', color: '#9a9a9a', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '1px', marginBottom: '8px' }}>Changer le statut</div>
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px' }}>
+                    {STATUTS.filter(s => s !== 'Nouveau').map(s => {
+                      const c = (STATUT_COLORS as any)[s]
+                      const active = selectedLead.statut === s
+                      return (
+                        <button key={s} onClick={() => changeStatut(selectedLead.id, s)} style={{ padding: '5px 11px', borderRadius: '20px', border: `1.5px solid ${active ? c : c + '60'}`, background: active ? c : c + '15', color: active ? 'white' : c, fontSize: '12px', fontWeight: 600, cursor: 'pointer', fontFamily: 'Outfit,sans-serif', transition: 'all 0.15s' }}>{s}</button>
+                      )
+                    })}
+                  </div>
+                </div>
+                {/* Relance */}
+                <div style={{ borderTop: '1px solid rgba(26,58,74,0.1)', paddingTop: '12px', marginTop: '12px' }}>
+                  <div style={{ fontSize: '10px', color: '#9a9a9a', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '1px', marginBottom: '8px' }}>
+                    🔔 Relance programmée {!selectedLead.relance_date && <span style={{ color: '#d4852a', fontSize: '10px', fontWeight: 400, marginLeft: '4px' }}>(auto 48h si non renseigné)</span>}
+                  </div>
+                  <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+                    <input type="datetime-local" defaultValue={selectedLead.relance_date?.slice(0,16)||''} onChange={e => setRelanceInput(e.target.value)} style={{ flex: 1, padding: '8px 12px', border: '1.5px solid rgba(26,58,74,0.15)', borderRadius: '8px', fontFamily: 'Outfit,sans-serif', fontSize: '13px', background: 'white' }} />
+                    <button onClick={() => saveRelance(selectedLead.id, relanceInput)} style={{ ...btnPrimary, padding: '8px 14px', fontSize: '12px', whiteSpace: 'nowrap' }}>Enregistrer</button>
+                  </div>
                 </div>
               </div>
 
@@ -371,7 +481,11 @@ export default function LeadsPage() {
               {/* Logs */}
               <div>
                 <label style={fieldLabel}>📋 Historique</label>
-                {(selectedLead.lead_logs || []).slice().reverse().map((log: any) => {
+                {(selectedLead.lead_logs || []).slice().reverse().filter((log: any) => {
+                  if (isManager) return true
+                  const a = log.action?.toLowerCase() || ''
+                  return !a.includes('créé') && !a.includes('importé') && !a.includes('manuellement')
+                }).map((log: any) => {
                   const auteur = profiles.find(p => p.id === log.auteur_id)
                   const color = log.result === 'Répondu' ? '#2d8a5e' : log.result === 'Pas répondu' ? '#e05a3a' : log.result === 'Rappel demandé' ? '#d4852a' : '#9a9a9a'
                   return (
@@ -436,6 +550,7 @@ export default function LeadsPage() {
 }
 
 function AddLeadModal({ profiles, onClose, onSave }: { profiles: Profile[], onClose: ()=>void, onSave: ()=>void }) {
+  const supabase = createClientComponentClient()
   const [nom, setNom] = useState('')
   const [tel, setTel] = useState('')
   const [email, setEmail] = useState('')

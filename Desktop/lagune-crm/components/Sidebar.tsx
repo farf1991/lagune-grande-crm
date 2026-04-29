@@ -1,16 +1,16 @@
 'use client'
 import { usePathname, useRouter } from 'next/navigation'
+import { createClientComponentClient } from '@supabase/auth-helpers-nextjs'
 import { Profile } from '@/lib/types'
-import { supabase } from '@/lib/supabase'
 
 export default function Sidebar({ profile }: { profile: Profile }) {
   const pathname = usePathname()
   const router = useRouter()
+  const supabase = createClientComponentClient()
 
   const logout = async () => {
     await supabase.auth.signOut()
-    router.push('/login')
-    router.refresh()
+    window.location.href = '/login'
   }
 
   const isAdmin = profile.role === 'admin'

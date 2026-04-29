@@ -1,9 +1,10 @@
 'use client'
 import { useState, useEffect } from 'react'
-import { supabase } from '@/lib/supabase'
+import { createClientComponentClient } from '@supabase/auth-helpers-nextjs'
 import { Profile } from '@/lib/types'
 
 export default function UsersPage() {
+  const supabase = createClientComponentClient()
   const [profiles, setProfiles] = useState<Profile[]>([])
   const [showAdd, setShowAdd] = useState(false)
   const [nom, setNom] = useState('')
